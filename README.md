@@ -1,4 +1,4 @@
-# 📒 Ledger Reconciliation · लेजर मिलान
+# 📒 Ledger Reconciliation
 
 A simple web app to reconcile **our books** (vendor/customer ledger from Tally, Zoho Books, QuickBooks or Excel)
 with the **party's ledger / statement of account**.
