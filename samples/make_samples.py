@@ -133,3 +133,73 @@ c = canvas.Canvas(str(HERE / "scanned_example.pdf"), pagesize=A4)
 c.rect(50, 500, 400, 200, fill=1)
 c.save()
 print("samples written; our closing Cr =", closing_cr, "vendor closing Dr =", bal)
+
+
+# ======================= AI samples =======================================================================
+# v2 pair: everything above PLUS cases that one-to-one rules cannot solve:
+#   * one payment of ₹1,47,500 in our books vs two receipts (₹59,000 + ₹88,500) in the party's books
+#   * one party invoice SI-113 ₹35,400 booked by us as two entries SHT/113 ₹23,600 + SHT/113A ₹11,800
+tally_v2 = tally + [
+    ("2-Sep-2024", "Purchase A/c", "Purchase", "SHT/111", None, 59000.00),
+    ("4-Sep-2024", "Purchase A/c", "Purchase", "SHT/112", None, 88500.00),
+    ("6-Sep-2024", "Purchase A/c", "Purchase", "SHT/113", None, 23600.00),
+    ("6-Sep-2024", "Purchase A/c (freight portion)", "Purchase", "SHT/113A", None, 11800.00),
+    ("20-Sep-2024", "HDFC Bank", "Payment", "34", 147500.00, None),
+    (None, "NEFT against bills 111 & 112", "", "", None, None),
+]
+# insert before the last (30-Sep) entry so dates stay in order; narration line stays after its voucher
+tally_v2 = tally[:-1] + tally_v2[len(tally):] + [tally[-1]]
+deb2 = sum(r[4] or 0 for r in tally_v2[1:])
+cre2 = sum(r[5] or 0 for r in tally_v2)
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "Ledger"
+for line in ["ABC Enterprises Pvt Ltd", "Plot 12, MIDC Andheri East, Mumbai", "Sharma Traders",
+             "Ledger Account", "1-Apr-2024 to 30-Sep-2024", None]:
+    ws.append([line])
+ws.append(["Date", "Particulars", "Vch Type", "Vch No.", "Debit", "Credit"])
+for r in tally_v2:
+    ws.append(list(r))
+ws.append([None, "Closing Balance", "", "", cre2 - deb2, None])
+ws.append([None, None, None, None, cre2, cre2])
+wb.save(HERE / "ai_our_books_tally_v2.xlsx")
+
+vendor_v2 = vendor + [
+    ("02/09/2024", "SI-111", "Sales Invoice", 59000.00, None),
+    ("04/09/2024", "SI-112", "Sales Invoice", 88500.00, None),
+    ("06/09/2024", "SI-113", "Sales Invoice (incl. freight)", 35400.00, None),
+    ("21/09/2024", "RCPT-0091", "Receipt against SI-111", None, 59000.00),
+    ("21/09/2024", "RCPT-0092", "Receipt against SI-112", None, 88500.00),
+]
+vendor_v2.sort(key=lambda r: pd.to_datetime(r[0], dayfirst=True))
+bal, rows2 = 0.0, []
+for d, ref, desc, dr, cr in vendor_v2:
+    bal += (dr or 0) - (cr or 0)
+    rows2.append((d, ref, desc, dr, cr, f"{bal:,.2f} Dr"))
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.append(["SHARMA TRADERS"])
+ws.append(["Statement of Account — Customer: ABC Enterprises Pvt Ltd"])
+ws.append([])
+ws.append(cols)
+for r in rows2:
+    ws.append(list(r))
+wb.save(HERE / "ai_party_statement_v2.xlsx")
+
+# "Scanned" party statement: render the table PDF to a slightly rotated, noisy grayscale image,
+# saved as JPG and as an image-only PDF (no text layer).
+import random
+import pypdfium2 as pdfium
+from PIL import Image, ImageFilter
+
+random.seed(7)
+page = pdfium.PdfDocument(str(HERE / "party_statement_sharma_traders.pdf"))[0]
+img = page.render(scale=2.2).to_pil().convert("L").rotate(0.6, expand=True, fillcolor=255)
+px = img.load()
+for _ in range(25000):
+    x, y = random.randrange(img.width), random.randrange(img.height)
+    px[x, y] = random.choice((150, 190, 230))
+img = img.filter(ImageFilter.GaussianBlur(0.5))
+img.save(HERE / "scanned_party_statement.jpg", quality=80)
+img.convert("RGB").save(HERE / "scanned_party_statement.pdf", "PDF", resolution=200)
+print("AI samples written")

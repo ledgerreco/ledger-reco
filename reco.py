@@ -26,8 +26,15 @@ import pandas as pd
 # --------------------------------------------------------------------------------------
 
 
-class ScannedPDFError(Exception):
+class NeedsVisionError(Exception):
+    """File has no machine-readable text (scanned PDF or an image) -> needs AI (vision) extraction."""
+
+
+class ScannedPDFError(NeedsVisionError):
     """Raised when a PDF has no extractable text (scanned / image-only)."""
+
+
+IMAGE_EXT = (".png", ".jpg", ".jpeg")
 
 
 def list_sheets(data: bytes, filename: str) -> list[str]:
@@ -42,6 +49,8 @@ def load_file(data: bytes, filename: str, sheet=0) -> tuple[pd.DataFrame, dict]:
     """Return a raw cell grid (header=None, all object dtype) plus info about how it was read."""
     name = filename.lower()
     info = {"source": None, "warnings": []}
+    if name.endswith(IMAGE_EXT):
+        raise NeedsVisionError("This is an image. Turn on Grok AI to read ledger rows from images.")
     if name.endswith(".pdf"):
         raw, src, warns = read_pdf(data)
         info["source"] = src
@@ -98,7 +107,7 @@ def read_pdf(data: bytes) -> tuple[pd.DataFrame, str, list[str]]:
         if text_len < 20:
             raise ScannedPDFError(
                 "This PDF has no readable text (it looks scanned / image-based). "
-                "Scanned PDFs are not supported yet — please export the ledger as Excel/CSV or a text PDF."
+                "Turn on Grok AI to read it, or export the ledger as Excel/CSV or a text PDF."
             )
 
     # Prefer tables if they look like a ledger (enough rows with a date-ish first cells and amounts)
@@ -516,6 +525,20 @@ class Result:
     statement: pd.DataFrame
     label_a: str = "Ledger A"
     label_b: str = "Ledger B"
+    # internals (kept so an AI pass can be applied on the leftovers)
+    A: pd.DataFrame | None = None
+    B: pd.DataFrame | None = None
+    rule_matches: list = field(default_factory=list)    # (i, j, kind)
+    mism_pairs: list = field(default_factory=list)      # (i, j)  after AI removals
+    free_a: set = field(default_factory=set)
+    free_b: set = field(default_factory=set)
+    amt_tol: float = 1.0
+    # AI results (empty when AI not used)
+    ai_groups: list = field(default_factory=list)       # accepted, validated groups
+    ai_matched: pd.DataFrame = field(default_factory=pd.DataFrame)
+    ai_notes: pd.DataFrame = field(default_factory=pd.DataFrame)
+    ai_summary: dict = field(default_factory=dict)
+    ai_status: str = ""                                  # "", "ok", "error: ..."
 
 
 def _greedy(pairs: list[tuple]) -> list[tuple[int, int]]:
@@ -610,17 +633,44 @@ def reconcile(a: Ledger, b: Ledger, flip_b: bool = True, date_tol: int = 7, amt_
     amount_pass(date_tol, f"2. Amount + Date (±{date_tol}d)")
     amount_pass(None, "3. Amount only")
 
-    # ---- Build output tables
-    def side(df, idx, prefix):
-        r = df.loc[idx]
-        return {f"{prefix} Row": r["row"], f"{prefix} Date": r["date"], f"{prefix} Ref": r["ref"],
-                f"{prefix} Narration": r["narration"], f"{prefix} Debit": r["debit"], f"{prefix} Credit": r["credit"]}
+    return finalize(a, b, A, B, matches, mism, free_a, free_b, flip_b, label_a, label_b, amt_tol)
 
+
+def apply_ai_groups(res: Result, groups: list[dict]) -> Result:
+    """Re-build the result with validated AI groups. Each group: {'a': [idx], 'b': [idx], 'kind', 'reason',
+    'confidence', 'difference_reason'}. Entries may come from 'only' lists or from rule amount-mismatch pairs."""
+    used_a = {i for g in groups for i in g["a"]}
+    used_b = {j for g in groups for j in g["b"]}
+    mism = [(i, j) for i, j in res.mism_pairs if i not in used_a and j not in used_b]
+    # a mismatch pair broken up by AI -> its other half goes back to the "only" lists
+    free_a = (res.free_a | {i for i, j in res.mism_pairs if (i, j) not in mism}) - used_a
+    free_b = (res.free_b | {j for i, j in res.mism_pairs if (i, j) not in mism}) - used_b
+    out = finalize(res.a, res.b, res.A, res.B, res.rule_matches, mism, free_a, free_b, res.flip_b,
+                   res.label_a, res.label_b, res.amt_tol, ai_groups=groups)
+    return out
+
+
+def _side(df, idx, prefix):
+    r = df.loc[idx]
+    return {f"{prefix} Row": r["row"], f"{prefix} Date": r["date"], f"{prefix} Ref": r["ref"],
+            f"{prefix} Narration": r["narration"], f"{prefix} Debit": r["debit"], f"{prefix} Credit": r["credit"]}
+
+
+def _entry_label(df, idx):
+    r = df.loc[idx]
+    d = r["date"].strftime("%d-%m-%Y") if pd.notna(r["date"]) else "?"
+    ref = r["ref"] or (r["narration"][:25] if r["narration"] else "-")
+    return f"{ref} {d} ({drcr(r['signed'])})"
+
+
+def finalize(a, b, A, B, matches, mism, free_a, free_b, flip_b, label_a, label_b, amt_tol, ai_groups=None) -> Result:
+    ai_groups = ai_groups or []
     rows = []
     for i, j, kind in matches:
-        d = {"Match Type": kind, **side(A, i, "A"), **side(B, j, "B")}
+        d = {"Match Type": kind, **_side(A, i, "A"), **_side(B, j, "B")}
         d["Difference"] = round(A.at[i, "cmp"] - B.at[j, "cmp"], 2)
-        d["Days Apart"] = _days(A.at[i, "date"], B.at[j, "date"]) if _days(A.at[i, "date"], B.at[j, "date"]) != 9999 else None
+        dd = _days(A.at[i, "date"], B.at[j, "date"])
+        d["Days Apart"] = dd if dd != 9999 else None
         rows.append(d)
     matched = pd.DataFrame(rows)
     if len(matched):
@@ -628,7 +678,7 @@ def reconcile(a: Ledger, b: Ledger, flip_b: bool = True, date_tol: int = 7, amt_
 
     rows = []
     for i, j in mism:
-        d = {**side(A, i, "A"), **side(B, j, "B")}
+        d = {**_side(A, i, "A"), **_side(B, j, "B")}
         d["A Amount"] = A.at[i, "cmp"]
         d["B Amount (A view)"] = B.at[j, "cmp"]
         d["Difference"] = round(A.at[i, "cmp"] - B.at[j, "cmp"], 2)
@@ -642,6 +692,21 @@ def reconcile(a: Ledger, b: Ledger, flip_b: bool = True, date_tol: int = 7, amt_
 
     only_a, only_b = only(A, free_a), only(B, free_b)
 
+    rows = []
+    for n, g in enumerate(ai_groups, start=1):
+        sa, sb = float(A.loc[g["a"], "cmp"].sum()), float(B.loc[g["b"], "cmp"].sum())
+        rows.append({
+            "Group": n, "Type": g.get("kind", ""),
+            "A Entries": "; ".join(_entry_label(A, i) for i in g["a"]), "A Total": round(sa, 2),
+            "B Entries": "; ".join(_entry_label(B, j) for j in g["b"]), "B Total (A view)": round(sb, 2),
+            "Difference": round(sa - sb, 2), "Status": g.get("status", "Matched"),
+            "Reason": g.get("reason", ""), "Difference Reason": g.get("difference_reason", ""),
+            "Confidence": g.get("confidence"),
+            "A Rows": ", ".join(str(int(A.at[i, "row"])) for i in g["a"]),
+            "B Rows": ", ".join(str(int(B.at[j, "row"])) for j in g["b"]),
+        })
+    ai_matched = pd.DataFrame(rows)
+
     # ---- Summary & reconciliation statement (everything in A's perspective, Dr positive)
     sgn = -1 if flip_b else 1
     open_a, open_b = a.opening, sgn * b.opening
@@ -652,6 +717,8 @@ def reconcile(a: Ledger, b: Ledger, flip_b: bool = True, date_tol: int = 7, amt_
     sum_only_b = float(B.loc[sorted(free_b), "cmp"].sum())
     mm_diff = float(mismatch["Difference"].sum()) if len(mismatch) else 0.0
     round_diff = float(A.loc[m_idx_a, "cmp"].sum() - B.loc[m_idx_b, "cmp"].sum())
+    ai_diff = float(ai_matched["Difference"].sum()) if len(ai_matched) else 0.0
+    ai_a = [i for g in ai_groups for i in g["a"]]
     diff = close_a - close_b
 
     summary = {
@@ -667,6 +734,9 @@ def reconcile(a: Ledger, b: Ledger, flip_b: bool = True, date_tol: int = 7, amt_
         "only_a_count": len(free_a), "only_a_amount": sum_only_a,
         "only_b_count": len(free_b), "only_b_amount": sum_only_b,
         "mismatch_count": len(mism), "mismatch_amount": mm_diff,
+        "ai_group_count": len(ai_groups), "ai_entry_count_a": len(ai_a),
+        "ai_entry_count_b": sum(len(g["b"]) for g in ai_groups),
+        "ai_amount": float(A.loc[ai_a, "cmp"].abs().sum()) if ai_a else 0.0, "ai_difference": ai_diff,
         "difference": diff,
     }
     lines = [
@@ -680,11 +750,15 @@ def reconcile(a: Ledger, b: Ledger, flip_b: bool = True, date_tol: int = 7, amt_
         (f"  Amount mismatches, same reference ({len(mism)})", mm_diff),
         ("  Small differences within tolerance on matched entries", round_diff),
     ]
-    explained = (open_a - open_b) + sum_only_a - sum_only_b + mm_diff + round_diff
+    if ai_groups:
+        lines.append((f"  Differences on AI-matched groups ({len(ai_groups)})", ai_diff))
+    explained = (open_a - open_b) + sum_only_a - sum_only_b + mm_diff + round_diff + ai_diff
     lines += [("Total explained", explained), ("Unexplained", diff - explained)]
     statement = pd.DataFrame(lines, columns=["Particulars", "Amount"])
     statement["Amount"] = statement["Amount"].map(lambda v: None if v is None else round(v, 2))
-    return Result(a, b, flip_b, matched, mismatch, only_a, only_b, summary, statement, label_a, label_b)
+    return Result(a, b, flip_b, matched, mismatch, only_a, only_b, summary, statement, label_a, label_b,
+                  A=A, B=B, rule_matches=list(matches), mism_pairs=list(mism), free_a=set(free_a),
+                  free_b=set(free_b), amt_tol=amt_tol, ai_groups=list(ai_groups), ai_matched=ai_matched)
 
 
 # --------------------------------------------------------------------------------------
@@ -729,6 +803,8 @@ def summary_table(res: Result) -> pd.DataFrame:
         ("Unmatched entries (only in this side)", s["only_a_count"], s["only_b_count"]),
         ("Amount mismatch (same ref)", s["mismatch_count"], s["mismatch_count"]),
     ]
+    if s.get("ai_group_count"):
+        rows.append((f"AI matched groups ({s['ai_group_count']}) — entries", s["ai_entry_count_a"], s["ai_entry_count_b"]))
     return pd.DataFrame(rows, columns=["Item", la, lb])
 
 
@@ -772,6 +848,23 @@ def to_excel(res: Result) -> bytes:
                 ws.write(r, 1, v)
                 r += 1
         ws.write(r + 1, 0, "A = " + la + "   |   B = " + lb)
+        r += 3
+        wrap = wb.add_format({"text_wrap": True, "valign": "top"})
+        if res.ai_summary:
+            ws.write(r, 0, "Grok AI summary", title)
+            r += 1
+            for key, lab in (("summary_en", "Summary"), ("summary_hi", "सारांश")):
+                if res.ai_summary.get(key):
+                    ws.write(r, 0, f"{lab}: {res.ai_summary[key]}", wrap)
+                    ws.set_row(r, 15 * max(2, len(res.ai_summary[key]) // 70 + 1))
+                    r += 1
+            for k, item in enumerate(res.ai_summary.get("action_items", []), start=1):
+                txt = item.get("action", "") if isinstance(item, dict) else str(item)
+                pr = item.get("priority", "") if isinstance(item, dict) else ""
+                ws.write(r, 0, f"Action {k}{' [' + pr + ']' if pr else ''}: {txt}", wrap)
+                r += 1
+        elif res.ai_status:
+            ws.write(r, 0, f"Grok AI: {res.ai_status}")
         ws.set_column(0, 0, 62)
         ws.set_column(1, 2, 24)
 
@@ -782,7 +875,7 @@ def to_excel(res: Result) -> bytes:
             d.to_excel(xw, sheet_name=name, index=False)
             w = xw.sheets[name]
             for c, col in enumerate(d.columns):
-                is_money = any(k in col for k in ("Debit", "Credit", "Difference", "Amount", "Net"))
+                is_money = "Reason" not in col and any(k in col for k in ("Debit", "Credit", "Difference", "Amount", "Net", "Total"))
                 width = min(max(12, len(str(col)) + 2, int(d[col].astype(str).str.len().max() or 0) + 2), 45)
                 w.set_column(c, c, width, money if is_money else None)
             w.freeze_panes(1, 0)
@@ -792,6 +885,9 @@ def to_excel(res: Result) -> bytes:
         dump(res.only_a, "Only in Ledger A")
         dump(res.only_b, "Only in Ledger B")
         dump(res.mismatch, "Amount Mismatch")
+        if res.ai_status:
+            dump(res.ai_matched, "AI Matched")
+            dump(res.ai_notes, "AI Notes")
     return out.getvalue()
 
 

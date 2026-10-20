@@ -6,3 +6,5 @@ __pycache__/
 secrets/
 .env
 samples/output_*.xlsx
+.streamlit/secrets.toml
+*.env
