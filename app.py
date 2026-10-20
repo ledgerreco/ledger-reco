@@ -4,8 +4,15 @@ import hashlib
 import pandas as pd
 import streamlit as st
 
+import importlib
+
 import ai
 import reco
+
+# Streamlit Cloud hot-reloads app.py but keeps old helper modules cached; reload them
+# so a new deploy never runs a new app.py against an old ai.py / reco.py.
+reco = importlib.reload(reco)
+ai = importlib.reload(ai)
 
 st.set_page_config(page_title="Ledger Reconciliation | लेजर मिलान", page_icon="📒", layout="wide")
 ss = st.session_state
