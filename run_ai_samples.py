@@ -1,4 +1,4 @@
-"""Live end-to-end check of the Grok AI features on the samples (needs XAI_API_KEY; costs a few cents).
+"""Live end-to-end check of the AI features on the samples (needs XAI_API_KEY; costs a few cents).
 Usage: python run_ai_samples.py"""
 import json
 from pathlib import Path

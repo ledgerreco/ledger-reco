@@ -75,7 +75,7 @@ def test_ai_groups_validated_and_applied():
     wb = openpyxl.load_workbook(io.BytesIO(reco.to_excel(res)))
     assert {"AI Matched", "AI Notes"} <= set(wb.sheetnames)
     text = " ".join(str(c.value) for row in wb["Summary"].iter_rows() for c in row if c.value)
-    assert "Grok AI summary" in text and "Ask for DN/04" in text
+    assert "AI summary" in text and "Ask for DN/04" in text
 
 
 def test_explained_difference_tds():
@@ -135,3 +135,33 @@ def test_api_key_lookup(monkeypatch):
     assert ai.get_api_key({"XAI_API_KEY": "k1"}) == "k1"
     monkeypatch.setenv("XAI_API_KEY", "k2")
     assert ai.get_api_key(None) == "k2"
+
+
+def test_instruction_passed_to_ai_calls():
+    rule = _rule_v2()
+    fake = FakeClient([{"groups": [], "notes": []},
+                       {"summary_en": "s", "summary_hi": "स", "action_items": []}])
+    systems = []
+    orig = fake.call_json
+    fake.call_json = lambda system, *a, **k: (systems.append(system), orig(system, *a, **k))[1]
+    ai.run_ai(rule, fake, instruction="TDS 2% ignore karo")
+    assert len(systems) == 2 and all("TDS 2% ignore karo" in s for s in systems)
+
+
+def test_chat_context_and_reply():
+    rule = _rule_v2()
+    ctx = ai.chat_context(rule, "sirf March")
+    assert "Reconciliation statement" in ctx and "all 19 entries" in ctx and "sirf March" in ctx
+    assert len(ctx) <= 60000
+    assert "No reconciliation" in ai.chat_context(None)
+
+    class ChatFake:
+        def call_text(self, messages, effort=None, max_output_tokens=0):
+            self.messages = messages
+            return "जवाब"
+    cf = ChatFake()
+    hist = [{"role": "user", "content": f"q{i}"} if i % 2 == 0 else {"role": "assistant", "content": "a" * 5000}
+            for i in range(30)]
+    assert ai.chat_reply(cf, ctx, hist, "SI-110 ka kya karna hai?") == "जवाब"
+    assert cf.messages[0]["role"] == "system" and cf.messages[-1]["content"].startswith("SI-110")
+    assert len(cf.messages) == 12 and all(len(m["content"]) <= 2500 for m in cf.messages[1:])

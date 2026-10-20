@@ -3,7 +3,7 @@
 A simple web app to reconcile **our books** (vendor/customer ledger from Tally, Zoho Books, QuickBooks or Excel)
 with the **party's ledger / statement of account**.
 
-- Upload two files: **xlsx, xls, csv, PDF, or scanned PDF / photo (jpg, png)**. Scanned files are read by Grok AI.
+- Upload two files: **xlsx, xls, csv, PDF, or scanned PDF / photo (jpg, png)**. Scanned files are read by AI AI.
 - Auto-detects the header row (Tally title rows are skipped) and the columns: Date, Voucher/Invoice No.,
   Particulars, Debit, Credit (or one Amount column with +/- or Dr/Cr). You can change any of it in the app.
 - Handles mirror ledgers (our Debit = party's Credit); switch it off in the sidebar if both files are from the same books.
@@ -14,9 +14,12 @@ with the **party's ledger / statement of account**.
   4. amount only (closest date)
 
   Amount tolerance default ₹1. Every match is one entry to one entry.
+- One page: uploads → optional **AI instruction** (e.g. "TDS 2% ignore karo", "sirf March ka data dekho") →
+  ⚙️ Settings (labels, mirror sign, tolerances, header row, column mapping, "read PDF with AI") → one
+  **✅ Reconcile karo / Submit** button → results → **💬 AI chat** about the reconciliation (Hindi/English/Hinglish).
 - Nothing runs until you click **✅ Reconcile karo / Submit**. Results stay in the session, so downloading the report
   doesn't run anything again.
-- **🤖 Grok AI (optional, xAI API):** after the rule passes, Grok reviews only the leftover entries and proposes
+- **🤖 AI review (runs on every submit):** after the rule passes, the AI reviews only the leftover entries and proposes
   grouped matches (one payment vs several bills, an invoice split into two entries, TDS/GST/discount/rounding
   differences), flags duplicates and missing entries, and writes a short English + Hindi summary with action items.
   The app checks every AI proposal before accepting it: the ids must exist, each entry can be used only once,
@@ -27,7 +30,7 @@ with the **party's ledger / statement of account**.
 - On-screen summary + reconciliation statement, and an **Excel report** with sheets:
   Summary (incl. AI summary), Matched, Only in Ledger A, Only in Ledger B, Amount Mismatch, AI Matched, AI Notes.
 - 🔒 Files are processed in memory on the server and are not stored. When AI is on, the unmatched entries
-  (and pages of scanned files) are sent to the xAI API.
+  (and pages of scanned files) are sent to an AI service.
 
 ## Run locally
 ```bash
@@ -35,17 +38,17 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Grok AI key
+## AI key (admin)
 Locally: `export XAI_API_KEY=...` or create `.streamlit/secrets.toml` (git-ignored) with `XAI_API_KEY = "..."`.
-On Streamlit Community Cloud: App → Settings → Secrets → `XAI_API_KEY = "..."`. Without a key the AI features
-are switched off and everything else works.
+On Streamlit Community Cloud: App → Settings → Secrets → `XAI_API_KEY = "..."`. Without a key the app shows an
+error for the AI part, and the rule-based results still work.
 
 ## Tests
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest
 python run_samples.py      # rule-based end-to-end run on samples/
-python run_ai_samples.py   # live Grok AI run (needs XAI_API_KEY, a few US cents)
+python run_ai_samples.py   # live AI AI run (needs XAI_API_KEY, a few US cents)
 ```
 
 ## Deploy free on Streamlit Community Cloud
@@ -58,7 +61,7 @@ python run_ai_samples.py   # live Grok AI run (needs XAI_API_KEY, a few US cents
 |---|---|
 | `app.py` | Streamlit UI (entry point) |
 | `reco.py` | Core logic: reading Excel/CSV/PDF, header & column detection, matching, Excel export |
-| `ai.py` | Grok AI: leftover matching + validation, summary, vision extraction of scanned files |
+| `ai.py` | AI AI: leftover matching + validation, summary, vision extraction of scanned files |
 | `.streamlit/config.toml` | 50 MB upload limit, headless, light theme |
 | `tests/` | pytest suite (AI tests use a fake client, no network) |
 | `run_samples.py` | End-to-end run on the sample files |

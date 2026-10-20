@@ -50,7 +50,7 @@ def load_file(data: bytes, filename: str, sheet=0) -> tuple[pd.DataFrame, dict]:
     name = filename.lower()
     info = {"source": None, "warnings": []}
     if name.endswith(IMAGE_EXT):
-        raise NeedsVisionError("This is an image. Turn on Grok AI to read ledger rows from images.")
+        raise NeedsVisionError("This is an image — the AI will read the ledger rows from it.")
     if name.endswith(".pdf"):
         raw, src, warns = read_pdf(data)
         info["source"] = src
@@ -107,7 +107,7 @@ def read_pdf(data: bytes) -> tuple[pd.DataFrame, str, list[str]]:
         if text_len < 20:
             raise ScannedPDFError(
                 "This PDF has no readable text (it looks scanned / image-based). "
-                "Turn on Grok AI to read it, or export the ledger as Excel/CSV or a text PDF."
+                "The AI can read it, or export the ledger as Excel/CSV or a text PDF."
             )
 
     # Prefer tables if they look like a ledger (enough rows with a date-ish first cells and amounts)
@@ -851,7 +851,7 @@ def to_excel(res: Result) -> bytes:
         r += 3
         wrap = wb.add_format({"text_wrap": True, "valign": "top"})
         if res.ai_summary:
-            ws.write(r, 0, "Grok AI summary", title)
+            ws.write(r, 0, "AI summary", title)
             r += 1
             for key, lab in (("summary_en", "Summary"), ("summary_hi", "सारांश")):
                 if res.ai_summary.get(key):
@@ -864,7 +864,7 @@ def to_excel(res: Result) -> bytes:
                 ws.write(r, 0, f"Action {k}{' [' + pr + ']' if pr else ''}: {txt}", wrap)
                 r += 1
         elif res.ai_status:
-            ws.write(r, 0, f"Grok AI: {res.ai_status}")
+            ws.write(r, 0, f"AI: {res.ai_status}")
         ws.set_column(0, 0, 62)
         ws.set_column(1, 2, 24)
 

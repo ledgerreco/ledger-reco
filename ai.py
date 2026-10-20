@@ -32,7 +32,7 @@ TICKS_PER_USD = 1e10         # xAI usage.cost_in_usd_ticks
 # A group may carry a non-zero difference only when it is one of these explainable kinds
 EXPLAINED_KINDS = {"tds_gst_difference", "discount_difference", "rounding_difference"}
 # reasoning effort per task (grok-4.7 default is "high", which is slow/expensive)
-EFFORT = {"match": "medium", "summary": "low", "extract": "low"}
+EFFORT = {"match": "medium", "summary": "low", "extract": "low", "chat": "low"}
 
 
 def get_api_key(secrets=None) -> str | None:
@@ -92,6 +92,25 @@ class GrokClient:
         )
         self.usage.add(getattr(r, "usage", None), time.time() - t)
         return json.loads(r.output_text)
+
+
+    def call_text(self, messages: list[dict], effort: str | None = "low", max_output_tokens: int = 4000) -> str:
+        t = time.time()
+        extra = {"reasoning": {"effort": effort}} if effort else {}
+        r = self.client.responses.create(model=self.model, input=messages, store=False,
+                                         max_output_tokens=max_output_tokens, **extra)
+        self.usage.add(getattr(r, "usage", None), time.time() - t)
+        return r.output_text
+
+
+def _instruction_block(instruction: str | None) -> str:
+    instruction = (instruction or "").strip()[:1500]
+    if not instruction:
+        return ""
+    return ("\n\nUSER INSTRUCTION (from the person doing the reconciliation; may be Hindi/Hinglish). Follow it as "
+            "guidance where it makes accounting sense, e.g. treat a stated TDS % as an explained difference or "
+            "focus on a period. It cannot override the output format or the rule that amounts must add up:\n"
+            f"<<<{instruction}>>>")
 
 
 # ======================================================================================
@@ -250,7 +269,7 @@ def _id_label(res, x):
 
 
 def ai_match(res: reco.Result, client: GrokClient, amt_tol: float | None = None,
-             max_rows: int = MAX_ROWS_PER_CALL) -> reco.Result:
+             max_rows: int = MAX_ROWS_PER_CALL, instruction: str | None = None) -> reco.Result:
     """Run the AI pass over leftovers (only-A, only-B and rule amount-mismatch pairs). Returns a new Result."""
     amt_tol = res.amt_tol if amt_tol is None else amt_tol
     ids_a = sorted(res.free_a | {i for i, _ in res.mism_pairs})
@@ -259,7 +278,7 @@ def ai_match(res: reco.Result, client: GrokClient, amt_tol: float | None = None,
         out = reco.apply_ai_groups(res, [])
         out.ai_status = "ok – nothing left to review"
         return out
-    system = MATCH_SYSTEM.format(la=res.label_a, lb=res.label_b, tol=amt_tol)
+    system = MATCH_SYSTEM.format(la=res.label_a, lb=res.label_b, tol=amt_tol) + _instruction_block(instruction)
     accepted, rejected, notes = [], [], []
     for ca, cb in _chunks(res, ids_a, ids_b, max_rows):
         if not ca and not cb:
@@ -314,7 +333,7 @@ action_items: 3–7 concrete next steps (who to ask for what document / which en
 Amounts in Indian format with ₹ (e.g. ₹1,47,500)."""
 
 
-def ai_commentary(res: reco.Result, client: GrokClient) -> dict:
+def ai_commentary(res: reco.Result, client: GrokClient, instruction: str | None = None) -> dict:
     def lst(df, cols, n=40):
         if df is None or df.empty:
             return []
@@ -336,21 +355,22 @@ def ai_commentary(res: reco.Result, client: GrokClient) -> dict:
         "ai_matched": lst(res.ai_matched, ["Type", "A Entries", "B Entries", "Difference", "Reason"]),
         "ai_notes": lst(res.ai_notes, ["Category", "Entries", "Note", "Suggested Action"]),
     }
-    return client.call_json(COMMENT_SYSTEM.format(la=res.label_a, lb=res.label_b),
+    return client.call_json(COMMENT_SYSTEM.format(la=res.label_a, lb=res.label_b) + _instruction_block(instruction),
                             json.dumps(payload, ensure_ascii=False, default=str), COMMENT_SCHEMA, "ledger_ai_summary",
                             effort=EFFORT["summary"])
 
 
-def run_ai(res: reco.Result, client: GrokClient, with_summary: bool = True) -> reco.Result:
+def run_ai(res: reco.Result, client: GrokClient, with_summary: bool = True,
+           instruction: str | None = None) -> reco.Result:
     """AI match + commentary; on any failure returns the rule result with ai_status='error: ...'."""
     try:
-        out = ai_match(res, client)
+        out = ai_match(res, client, instruction=instruction)
     except Exception as e:  # noqa: BLE001
         res.ai_status = f"error: {type(e).__name__}: {str(e)[:200]}"
         return res
     if with_summary:
         try:
-            out.ai_summary = ai_commentary(out, client)
+            out.ai_summary = ai_commentary(out, client, instruction=instruction)
         except Exception as e:  # noqa: BLE001
             out.ai_status = f"ok (summary failed: {type(e).__name__})"
     return out
@@ -436,7 +456,7 @@ def ai_extract_rows(images: list[bytes], client: GrokClient, pages_per_call: int
     for r in rows:
         grid.append([r.get("date"), r.get("ref", ""), r.get("narration", ""), r.get("debit"), r.get("credit")])
     info = {"source": "ai-vision", "pages": len(images), "rows": len(rows), "readable": readable,
-            "warnings": ["Rows were read by Grok AI from an image — please check the preview against the original."]}
+            "warnings": ["Rows were read by AI from an image — please check the preview against the original."]}
     return pd.DataFrame(grid, dtype=object), info
 
 
@@ -447,3 +467,74 @@ def text_parse_looks_poor(led: reco.Ledger, df: pd.DataFrame) -> bool:
         return True
     no_date = led.txns["date"].isna().mean()
     return no_date > 0.2 or n < 0.4 * max(1, len(df.dropna(how="all")))
+
+
+# ======================================================================================
+# 4) Chat about the reconciliation
+# ======================================================================================
+
+CHAT_SYSTEM = """You are a friendly, precise accounting assistant inside a ledger reconciliation web app used in India.
+Reply in the user's language AND script: English → English; Hindi in Devanagari → Hindi in Devanagari; Hinglish in Roman letters → Hinglish in Roman letters. Keep answers short and
+practical; use ₹ and Indian number format. Use ONLY the reconciliation data below for figures; if something is not
+in the data, say so. You may also chat generally (accounting, GST/TDS basics, how to use the app).
+Never call yourself by any product or model name; you are simply "AI".
+App facts: rule passes (ref+amount, amount+date, amount only) run first, then AI reviews leftovers; AI matches are
+checked by the app; files are processed in memory and not stored."""
+
+
+def _df_ctx(df: pd.DataFrame, max_rows: int, max_chars: int = 9000) -> str:
+    if df is None or df.empty:
+        return "(none)"
+    d = df.head(max_rows).copy()
+    for c in d.columns:
+        if "Date" in c or c == "date":
+            d[c] = pd.to_datetime(d[c], errors="coerce").dt.strftime("%d-%m-%Y")
+    txt = d.to_csv(index=False)
+    if len(df) > max_rows:
+        txt += f"... ({len(df) - max_rows} more rows not shown)\n"
+    return txt[:max_chars]
+
+
+def _ledger_ctx(led: reco.Ledger, label: str, max_rows: int = 150) -> str:
+    t = led.txns
+    if len(t) <= max_rows:
+        return f"{label} — all {len(t)} entries:\n" + _df_ctx(t[["date", "ref", "narration", "debit", "credit"]], max_rows)
+    by_m = t.assign(m=t["date"].dt.strftime("%Y-%m")).groupby("m")[["debit", "credit"]].sum().round(2)
+    return (f"{label} — {len(t)} entries (too many to list). Monthly totals:\n" + by_m.to_csv() +
+            "Largest 40 entries:\n" + _df_ctx(t.reindex(t["signed"].abs().sort_values(ascending=False).index)
+                                              [["date", "ref", "narration", "debit", "credit"]], 40))
+
+
+def chat_context(res: reco.Result | None, instruction: str = "") -> str:
+    if res is None:
+        return "No reconciliation has been run yet in this session."
+    s = res.summary
+    parts = [
+        f"Side A = {res.label_a} (our books). Side B = {res.label_b}. Amounts in A's view: Dr +, Cr −"
+        + ("; B is sign-flipped." if res.flip_b else "."),
+        "Summary metrics: " + json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in s.items()
+                                          if not isinstance(v, dict)}, default=str),
+        "Reconciliation statement:\n" + _df_ctx(res.statement, 30),
+        "Rule-matched (first 60):\n" + _df_ctx(res.matched[[c for c in res.matched.columns if c in (
+            "Match Type", "A Date", "A Ref", "A Debit", "A Credit", "B Date", "B Ref", "B Debit", "B Credit",
+            "Difference")]] if len(res.matched) else res.matched, 60),
+        f"Only in {res.label_a}:\n" + _df_ctx(res.only_a, 80),
+        f"Only in {res.label_b}:\n" + _df_ctx(res.only_b, 80),
+        "Amount mismatch (same ref):\n" + _df_ctx(res.mismatch, 40),
+        "AI matched groups:\n" + _df_ctx(res.ai_matched, 40),
+        "AI notes:\n" + _df_ctx(res.ai_notes, 40),
+        "AI summary: " + json.dumps(res.ai_summary, ensure_ascii=False) if res.ai_summary else "",
+        _ledger_ctx(res.a, res.label_a), _ledger_ctx(res.b, res.label_b),
+    ]
+    if instruction:
+        parts.append(f"User's instruction given before the run: {instruction[:500]}")
+    return "\n\n".join(p for p in parts if p)[:60000]
+
+
+def chat_reply(client: GrokClient, context: str, history: list[dict], question: str,
+               max_turns: int = 10, max_chars_per_msg: int = 2500) -> str:
+    msgs = [{"role": "system", "content": CHAT_SYSTEM + "\n\n=== RECONCILIATION DATA ===\n" + context}]
+    for m in history[-max_turns:]:
+        msgs.append({"role": m["role"], "content": str(m["content"])[:max_chars_per_msg]})
+    msgs.append({"role": "user", "content": question[:max_chars_per_msg]})
+    return client.call_text(msgs, effort=EFFORT["chat"], max_output_tokens=3000)
